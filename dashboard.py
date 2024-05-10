@@ -166,7 +166,7 @@ def plot_data_and_save_html(issues, active_state_dates):
         header=dict(values=['Ticket Key', 'Summary','Age (days)', 'Status']),
         cells=dict(values=[df['Key'], df['Summary'], df['Age (days)'], df['Status']])
     )])
-    fig_table.update_layout(title='Ticket Details')
+    fig_table.update_layout(title='Ticket Details',width=600, height=500)
 
     # Status summary table
     status_counts = df['Status'].value_counts().reindex(status_order, fill_value=0)
@@ -233,7 +233,7 @@ def plot_data_and_save_html(issues, active_state_dates):
         header=dict(values=['Average','85th']),
         cells=dict(values=[avg_age,value])
     )])
-    fig_cycle.update_layout(title='Cycle Time Stats')
+    fig_cycle.update_layout(title='Cycle Time Stats',width=500, height=300)
 
     # Saving to HTML
     scatter_html = pio.to_html(fig_scatter, full_html=False)
@@ -265,9 +265,9 @@ def plot_data_and_save_html(issues, active_state_dates):
     </html>
     """
 
-    with open('Sprint_test' + sprint_id + '.html', 'w') as f:
+    with open('Sprint' + sprint_id + '.html', 'w') as f:
         f.write(html)
-        print('Sprint_test' + sprint_id + '.html' + ' created')
+        print('Sprint' + sprint_id + '.html' + ' created')
 
         
 
