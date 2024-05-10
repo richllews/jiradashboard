@@ -1,5 +1,5 @@
 from imports import *
-
+from constants import *
 
 # Constants
 JIRA_URL = '<JIRA URL>'
