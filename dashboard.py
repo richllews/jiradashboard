@@ -1,15 +1,6 @@
 from imports import *
 from constants import *
 
-# Constants
-JIRA_URL = '<JIRA URL>'
-EXCLUDED_ISSUE_TYPES = ['Sub-task']  # Add or remove types based on your requirements
-API_TOKEN = '<YOUR JIRA API KEY>'
-USER_EMAIL = '<YOUR EMAIL>'
-headers = {
-    "Accept": "application/json"
-}
-
 def get_issues_for_sprint(sprint_id):
     url = f"{JIRA_URL}/rest/agile/1.0/sprint/{sprint_id}/issue"
     response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
