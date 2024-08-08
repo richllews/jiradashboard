@@ -1,31 +1,64 @@
 from imports import *
 from constants import *
 
+# Utility functions
 def get_issues_for_sprint(sprint_id):
     url = f"{JIRA_URL}/rest/agile/1.0/sprint/{sprint_id}/issue"
-    response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching issues for sprint {sprint_id}: {e}")
+        return None
 
 def get_issue_changelog(issue_id):
     url = f"{JIRA_URL}/rest/api/3/issue/{issue_id}?expand=changelog"
-    response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
-    response.raise_for_status()
-    return response.json()['changelog']['histories']
+    try:
+        response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
+        response.raise_for_status()
+        return response.json()['changelog']['histories']
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching changelog for issue {issue_id}: {e}")
+        return []
 
 def find_status_change_date(changelog, statuses, find_earliest=True):
-    """Find the earliest or latest date when the issue was moved to specified statuses."""
     relevant_date = None
     search_order = changelog if find_earliest else reversed(changelog)
     for history in search_order:
         for item in history['items']:
-            if item['field'] == 'status' and item['toString'] in statuses:
+            if item['field'] == 'status' and item['toString'].title() in statuses:
                 date = datetime.strptime(history['created'], '%Y-%m-%dT%H:%M:%S.%f%z').replace(tzinfo=timezone.utc)
                 if relevant_date is None or (find_earliest and date < relevant_date) or (not find_earliest and date > relevant_date):
                     relevant_date = date
     return relevant_date
 
-from datetime import timedelta
+def calculate_time_in_status(changelog):
+    time_in_status = {}
+    current_status = None
+    current_start_date = None
+    
+    for history in sorted(changelog, key=lambda x: datetime.strptime(x['created'], '%Y-%m-%dT%H:%M:%S.%f%z')):
+        for item in history['items']:
+            if item['field'] == 'status':
+                change_date = datetime.strptime(history['created'], '%Y-%m-%dT%H:%M:%S.%f%z')
+                if current_status is not None:
+                    duration = (change_date - current_start_date).total_seconds() / 86400  # Convert to days
+                    if current_status in time_in_status:
+                        time_in_status[current_status] += duration
+                    else:
+                        time_in_status[current_status] = duration
+                current_status = item['toString'].title()
+                current_start_date = change_date
+
+    if current_status is not None and current_start_date is not None:
+        duration = (datetime.now(timezone.utc) - current_start_date).total_seconds() / 86400
+        if current_status in time_in_status:
+            time_in_status[current_status] += duration
+        else:
+            time_in_status[current_status] = duration
+    
+    return time_in_status
 
 def daterange(start_date, end_date):
     for n in range(int((end_date - start_date).days) + 1):
@@ -33,251 +66,274 @@ def daterange(start_date, end_date):
 
 def parse_issues(issue_data):
     issues = []
-    final_statuses = ["Approved for Release", "Testing", "Closed"]
+    final_statuses = ["Approved For Release", "Testing", "Closed"]
     active_statuses = ["In Progress", "Blocked", "Peer Review", "Pending Deployment"]
     status_timeline = {}
+    time_in_status_all_issues = {}
+    current_status_times = []
 
     for issue in issue_data['issues']:
-
-        if issue['fields']['issuetype']['name'] in EXCLUDED_ISSUE_TYPES:
-            continue 
-
+        issue_type = issue['fields']['issuetype']['name']
         changelog = get_issue_changelog(issue['id'])
-        previous_status = None
 
-        # Tracking changes in active status for timeline
+        time_in_status = calculate_time_in_status(changelog)
+        time_in_status_all_issues[issue['key']] = time_in_status
+
+        current_status = issue['fields']['status']['name'].title()
+        if current_status in time_in_status:
+            current_status_times.append({
+                'Key': issue['key'],
+                'Status': current_status,
+                'Time in Status (days)': time_in_status[current_status]
+            })
+        
+        #if current_status not in active_statuses + final_statuses:
+         #   print(f"Unexpected status '{current_status}' for issue {issue['key']}")
+
+        #print(f"Processing changelog for issue {issue['key']}")
+        in_active_status = False
+
         for entry in sorted(changelog, key=lambda x: datetime.strptime(x['created'], '%Y-%m-%dT%H:%M:%S.%f%z').date()):
+            change_date = datetime.strptime(entry['created'], '%Y-%m-%dT%H:%M:%S.%f%z').date()
             for item in entry['items']:
                 if item['field'] == 'status':
-                    change_date = datetime.strptime(entry['created'], '%Y-%m-%dT%H:%M:%S.%f%z').date()
-                    if item['fromString'] in active_statuses:
-                        if change_date in status_timeline:
-                            status_timeline[change_date] -= 1
-                        else:
-                            status_timeline[change_date] = status_timeline.get(change_date, 0) - 1
-                    if item['toString'] in active_statuses:
-                        if change_date in status_timeline:
-                            status_timeline[change_date] += 1
-                        else:
-                            status_timeline[change_date] = status_timeline.get(change_date, 0) + 1
+                    from_status = item.get('fromString')
+                    to_status = item.get('toString')
+                    if from_status:
+                        from_status = from_status.title()
+                    if to_status:
+                        to_status = to_status.title()
+                    
+                    if to_status in active_statuses and not in_active_status:
+                        # Increment when entering an active status for the first time
+                        #print(f"Incrementing count for {change_date} due to entering {to_status}")
+                        status_timeline[change_date] = status_timeline.get(change_date, 0) + 1
+                        in_active_status = True
+                    elif from_status in active_statuses and to_status in final_statuses:
+                        # Decrement when moving from an active status to a final status
+                        #print(f"Decrementing count for {change_date} due to leaving {from_status} and entering {to_status}")
+                        status_timeline[change_date] = status_timeline.get(change_date, 0) - 1
+                        in_active_status = False
 
-        # Finding dates related to status changes
         in_progress_date = find_status_change_date(changelog, ["In Progress"], find_earliest=True)
         last_final_status_date = find_status_change_date(changelog, final_statuses, find_earliest=False)
 
-        # Calculating age of the ticket or setting it to 'N/A'
         if in_progress_date:
             end_date = last_final_status_date if last_final_status_date and last_final_status_date > in_progress_date else datetime.now(timezone.utc)
             age_seconds = (end_date - in_progress_date).total_seconds()
-            age_days = age_seconds / 86400 + 1  # Convert seconds to days
+            age_days = age_seconds / 86400 + 1
         else:
             age_days = 'N/A'
 
-        # Ensuring each issue has 'Date' key even if it's None
+        if issue_type not in EXCLUDED_ISSUE_TYPES and in_progress_date and last_final_status_date and last_final_status_date > in_progress_date:
+            cycle_time_seconds = (last_final_status_date - in_progress_date).total_seconds()
+            cycle_time_days = cycle_time_seconds / 86400 + 1
+        else:
+            cycle_time_days = None
+
         issues.append({
             'Key': issue['key'],
             'Age (days)': age_days,
-            'Status': issue['fields']['status']['name'],
+            'Cycle Time (days)': cycle_time_days,
+            'Status': issue['fields']['status']['name'].title(),
             'Summary': issue['fields']['summary'],
-            'Date': last_final_status_date.date() if last_final_status_date else None  # Ensure 'Date' is always set
+            'issuetype': issue['fields']['issuetype']['name'],
+            'Date': last_final_status_date.date() if last_final_status_date else None
         })
 
-    if not status_timeline:
-        return issues, {}
+    if status_timeline:
+        #print(f"Initial status timeline: {status_timeline}")
+        min_date = min(status_timeline.keys())
+        max_date = max(status_timeline.keys())
+        full_timeline = {}
+        current_count = 0
+        for single_date in daterange(min_date, max_date):
+            if single_date in status_timeline:
+                current_count += status_timeline[single_date]
+            full_timeline[single_date] = max(0, current_count)
+        #print(f"Full timeline: {full_timeline}")
+        return issues, full_timeline, time_in_status_all_issues, current_status_times
+    else:
+        return issues, {}, time_in_status_all_issues, current_status_times
 
-    # Normalize timeline to ensure all days are covered
-    min_date = min(status_timeline.keys())
-    max_date = max(status_timeline.keys())
-    full_timeline = {}
-    current_count = 0
-    for single_date in daterange(min_date, max_date):
-        if single_date in status_timeline:
-            current_count += status_timeline[single_date]
-        full_timeline[single_date] = max(0, current_count)
+def plot_wip_trend(active_state_dates):
+    if active_state_dates:
+        active_dates, counts = zip(*sorted(active_state_dates.items()))
+        #print(f"Active Dates: {active_dates}")
+        #print(f"Counts: {counts}")
+        fig_active = go.Figure()
+        fig_active.add_trace(go.Scatter(x=active_dates, y=counts, mode='lines+markers', name='Active Items Count'))
+        fig_active.update_layout(title='WIP Trend', xaxis_title='Date', yaxis_title='Count')
+        return pio.to_html(fig_active, full_html=False)
+    return ""
 
-    return issues, full_timeline
-
-
-
-def plot_data_and_save_html(issues, active_state_dates):
+def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, sprint_id):
     df = pd.DataFrame(issues)
-    df['Age (days)'] = pd.to_numeric(df['Age (days)'], errors='coerce')
-    df['Age (days)'] = df['Age (days)'].round(1)
-     # df['Age (days)'].fillna('Not Started', inplace=True)
-    status_order = ["Ready For Dev", "Blocked", "In Progress", "Peer review", "Pending Deployment", "Testing", "Approved for Release", "Closed"]
+    df['Age (days)'] = pd.to_numeric(df['Age (days)'], errors='coerce').round(1)
+    status_order = ["Ready For Dev", "Blocked", "In Progress", "Peer Review", "Pending Deployment", "Testing", "Approved For Release", "Closed"]
     df['Status'] = pd.Categorical(df['Status'], categories=status_order, ordered=True)
     df.sort_values('Status', inplace=True)
 
     # Plotting ticket ages by status
     fig_scatter = go.Figure()
-    fig_scatter.update_traces(hoverdistance=1450)  # Increase hover distance; adjust the value as needed
+    fig_scatter.update_traces(hoverdistance=1450)
     urls = ['https://theplatform.jira.com/browse/' + key for key in df['Key']]
     for status in status_order:
         subset = df[df['Status'] == status]
-        fig_scatter.add_trace(
-            go.Scatter(
-                x=[status] * len(subset),
-                y=subset['Age (days)'],
-                mode='markers',
-                name='',
-                marker=dict(size=12),
-                text=subset['Key'] + ': ' + subset['Summary'],
-                customdata=urls,
-                hoverinfo='text+y',
-                )
-        )
+        fig_scatter.add_trace(go.Scatter(
+            x=[status] * len(subset),
+            y=subset['Age (days)'],
+            mode='markers',
+            name=status,
+            marker=dict(size=12),
+            text=subset['Key'] + ': ' + subset['Summary'],
+            customdata=urls,
+            hoverinfo='text+y',
+        ))
 
-    # Extract prefix from the 'Key' for pie chart grouping
     df['Prefix'] = df['Key'].apply(lambda x: x.split('-')[0])
-
-    # Create the first general pie chart
     prefix_counts = df['Prefix'].value_counts().reset_index()
     prefix_counts.columns = ['Prefix', 'Count']
     fig_pie_general = go.Figure(data=[go.Pie(labels=prefix_counts['Prefix'], values=prefix_counts['Count'], hole=.3)])
     fig_pie_general.update_layout(title="Ticket Distribution by Project in the Current Sprint")
 
-    # Filtering for final statuses
-    final_statuses = ["Approved for Release", "Testing", "Closed"]
+    final_statuses = ["Approved For Release", "Testing", "Closed"]
     final_df = df[df['Status'].isin(final_statuses)]
+    filtered_df = final_df[final_df['issuetype'] != 'Sub-task']
 
-    # Create the second pie chart for tickets in final statuses
-    final_prefix_counts = final_df['Prefix'].value_counts().reset_index()
+    final_prefix_counts = filtered_df['Prefix'].value_counts().reset_index()
     final_prefix_counts.columns = ['Prefix', 'Count']
     fig_pie_final = go.Figure(data=[go.Pie(labels=final_prefix_counts['Prefix'], values=final_prefix_counts['Count'], hole=.3)])
     fig_pie_final.update_layout(title="Completed Ticket Distribution by Project")
 
-    # Create the second pie chart for ticket statuses
     pie_status_counts = df['Status'].value_counts().reset_index()
     pie_status_counts.columns = ['Status', 'Count']
     fig_pie_status = go.Figure(data=[go.Pie(labels=pie_status_counts['Status'], values=pie_status_counts['Count'], hole=.3)])
     fig_pie_status.update_layout(title="Tickets by Status")
 
+    fig_scatter.update_layout(title='Item Ageing', xaxis_title='Status', yaxis_title='Age (days)', yaxis=dict(type='linear'))
 
-
-    fig_scatter.update_layout(
-        title='Item Ageing',
-        xaxis_title='Status',
-        yaxis_title='Age (days)',
-        yaxis=dict(type='linear')
-    )
-
-    # Table of ticket details
     fig_table = go.Figure(data=[go.Table(
-        header=dict(values=['Ticket Key', 'Summary','Age (days)', 'Status']),
-        cells=dict(values=[df['Key'], df['Summary'], df['Age (days)'], df['Status']])
+        header=dict(values=['Ticket Key', 'Issue type', 'Summary','Age (days)', 'Status']),
+        cells=dict(values=[df['Key'], df['issuetype'], df['Summary'], df['Age (days)'], df['Status']])
     )])
-    fig_table.update_layout(title='Ticket Details',width=600, height=500)
+    fig_table.update_layout(title='Ticket Details')
 
-    # Status summary table
     status_counts = df['Status'].value_counts().reindex(status_order, fill_value=0)
     fig_summary = go.Figure(data=[go.Table(
         header=dict(values=['Status', 'Count']),
         cells=dict(values=[status_counts.index, status_counts.values])
     )])
-    fig_summary.update_layout(title='Status Summary')
-
-    # New line plot for active items over time
-    active_dates, counts = zip(*sorted(active_state_dates.items()))
-    fig_active = go.Figure()
-    fig_active.add_trace(go.Scatter(x=active_dates, y=counts, mode='lines+markers', name='Active Items Count'))
-    fig_active.update_layout(title='WIP Trend', xaxis_title='Date', yaxis_title='Count')
-
-
-
-    # Additional scatter plot for tickets in final statuses with Date on x-axis and Age on y-axis
-    final_df = df[df['Status'].isin(["Approved for Release", "Testing", "Closed"])]
-
-      #final_ticket_ids = final_df['Key'].tolist()
-      #print("Final Status Ticket IDs in the scatter plot:", final_ticket_ids)
-
+    fig_summary.update_layout(title='Status Summary', width=600, height=500)
 
     fig_final_status_scatter = go.Figure()
-    fig_final_status_scatter.add_trace(go.Scatter(
-        x=final_df['Date'],
-        y=final_df['Age (days)'],
-        mode='markers',
-        marker=dict(size=12),
-        text=final_df['Key'],
-        name=''
-    ))
 
-    # Adding percentile and average lines
-    for percentile in [50, 70, 85]:
-        value = np.percentile(final_df['Age (days)'].dropna(), percentile)
+    # Ensure avg_age is always defined
+    avg_age = None
+    if not final_df['Cycle Time (days)'].dropna().empty:
+        avg_age = final_df['Cycle Time (days)'].mean().round(1)
+        for percentile in [50, 70, 85]:
+            value = np.percentile(final_df['Cycle Time (days)'].dropna(), percentile)
+            fig_final_status_scatter.add_trace(go.Scatter(
+                x=[final_df['Date'].min(), final_df['Date'].max()],
+                y=[value, value],
+                mode='lines',
+                line=dict(dash='dash'),
+                name=f'{percentile}th percentile'
+            ))
+
         fig_final_status_scatter.add_trace(go.Scatter(
             x=[final_df['Date'].min(), final_df['Date'].max()],
-            y=[value, value],
+            y=[avg_age, avg_age],
             mode='lines',
-            line=dict(dash='dash'),
-            name=f'{percentile}th percentile'
+            line=dict(color='red', width=1, dash='dash'),
+            name='Average Age'
         ))
 
-    avg_age = final_df['Age (days)'].mean().round(1)
-    fig_final_status_scatter.add_trace(go.Scatter(
-        x=[final_df['Date'].min(), final_df['Date'].max()],
-        y=[avg_age, avg_age],
-        mode='lines',
-        line=dict(color='red', width=1, dash='dash'),
-        name='Average Age'
-    ))
+    fig_final_status_scatter.update_layout(title='Cycle Time', xaxis_title='Date', yaxis_title='Age (days)', legend_title="Legend")
 
-    fig_final_status_scatter.update_layout(
-        title='Cycle Time',
-        xaxis_title='Date',
-        yaxis_title='Age (days)',
-        legend_title="Legend"
-    )
+    time_in_status_df = pd.DataFrame(time_in_status_all_issues).T.fillna(0)
+    fig_time_in_status = go.Figure()
+    for status in time_in_status_df.columns:
+        fig_time_in_status.add_trace(go.Bar(
+            x=time_in_status_df.index,
+            y=time_in_status_df[status],
+            name=status
+        ))
 
-     # Table of cycle times
-    fig_cycle = go.Figure(data=[go.Table(
-        header=dict(values=['Average','85th']),
-        cells=dict(values=[avg_age,value])
-    )])
-    fig_cycle.update_layout(title='Cycle Time Stats',width=500, height=300)
+    fig_time_in_status.update_layout(title='Time Spent in Each Status (life of ticket)', xaxis_title='Ticket Key', yaxis_title='Time (days)', barmode='stack')
 
-    # Saving to HTML
+    current_status_df = pd.DataFrame(current_status_times)
+    fig_current_status_scatter = go.Figure()
+    for status in status_order:
+        subset = current_status_df[current_status_df['Status'] == status]
+        fig_current_status_scatter.add_trace(go.Scatter(
+            x=[status] * len(subset),
+            y=subset['Time in Status (days)'],
+            mode='markers',
+            marker=dict(size=12),
+            text=subset['Key'],
+            name=status
+        ))
+
+    fig_current_status_scatter.update_layout(title='How long have ticket been in a column?', xaxis_title='Status', yaxis_title='Time in Status (days)', legend_title="Legend")
+
+    fig_cycle = go.Figure()
+    if avg_age is not None:
+        fig_cycle = go.Figure(data=[go.Table(
+            header=dict(values=['Average','85th']),
+            cells=dict(values=[avg_age,value])
+        )])
+        fig_cycle.update_layout(title='Cycle Time Stats', width=500, height=300)
+
     scatter_html = pio.to_html(fig_scatter, full_html=False)
     table_html = pio.to_html(fig_table, full_html=False)
     summary_html = pio.to_html(fig_summary, full_html=False)
-    active_html = pio.to_html(fig_active, full_html=False)
     final_html = pio.to_html(fig_final_status_scatter, full_html=False)
     pie_html_general = pio.to_html(fig_pie_general, full_html=False)
     pie_html_final = pio.to_html(fig_pie_final, full_html=False)
     cycle_html_final = pio.to_html(fig_cycle, full_html=False)
     pie_html_status = pio.to_html(fig_pie_status, full_html=False)
+    time_in_status_html = pio.to_html(fig_time_in_status, full_html=False)
+    current_status_scatter_html = pio.to_html(fig_current_status_scatter, full_html=False)
+    
+    wip_trend_html = plot_wip_trend(active_state_dates)
+
     html = f"""
     <html>
     <head>
     <title>Dashboard</title>
     </head>
     <body>
-    <h1>JIRA Ticket Analysis Dashboard</h1>
+    <h1>Sprint Dashboard</h1>
     {scatter_html}
-    {table_html}   
-    {active_html}
-    {final_html}
+    {time_in_status_html}
+    {current_status_scatter_html}
+    {table_html}
+    {wip_trend_html}
+    <!--{final_html}-->
     {cycle_html_final}
     {summary_html}
     {pie_html_general}
-    {pie_html_final}   
+    {pie_html_final}
     {pie_html_status}   
     </body>
     </html>
     """
 
-    with open('Sprint' + sprint_id + '.html', 'w') as f:
+    file_path = f'Sprint_{sprint_id}.html'
+    with open(file_path, 'w') as f:
         f.write(html)
-        print('Sprint' + sprint_id + '.html' + ' created')
-
-        
+    print(f'{file_path} created')
 
 def main(sprint_id):
     issue_data = get_issues_for_sprint(sprint_id)
-    issues, active_state_dates = parse_issues(issue_data)
-    plot_data_and_save_html(issues, active_state_dates)
-
+    if issue_data:
+        issues, active_state_dates, time_in_status_all_issues, current_status_times = parse_issues(issue_data)
+        plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, sprint_id)
+    else:
+        print(f"Failed to retrieve data for sprint {sprint_id}")
 
 if __name__ == '__main__':
     sprint_id = input("Enter Sprint ID: ")
-
     main(sprint_id)
