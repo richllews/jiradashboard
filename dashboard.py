@@ -124,7 +124,7 @@ def parse_issues(issue_data):
                         in_active_status = False
 
         in_progress_date = find_status_change_date(changelog, ["In Progress"], find_earliest=True)
-        last_final_status_date = find_status_change_date(changelog, final_statuses, find_earliest=False)
+        last_final_status_date = find_status_change_date(changelog, final_statuses, find_earliest=True)
 
         if in_progress_date:
             end_date = last_final_status_date if last_final_status_date and last_final_status_date > in_progress_date else datetime.now(timezone.utc)
