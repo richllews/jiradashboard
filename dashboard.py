@@ -2,6 +2,21 @@ from imports import *
 from constants import *
 
 # Utility functions
+def get_active_sprint_id(board_id):
+    url = f"{JIRA_URL}/rest/agile/1.0/board/{board_id}/sprint?state=active"
+    try:
+        response = requests.get(url, auth=(USER_EMAIL, API_TOKEN), headers=headers)
+        response.raise_for_status()
+        sprints = response.json()['values']
+        if sprints:
+            return sprints[0]['id']  # Assuming there's only one active sprint
+        else:
+            print(f"No active sprint found for board {board_id}.")
+            return None
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching active sprint for board {board_id}: {e}")
+        return None
+
 def get_issues_for_sprint(sprint_id):
     url = f"{JIRA_URL}/rest/agile/1.0/sprint/{sprint_id}/issue"
     try:
@@ -71,6 +86,7 @@ def parse_issues(issue_data):
     status_timeline = {}
     time_in_status_all_issues = {}
     current_status_times = []
+    cycle_times = []
 
     for issue in issue_data['issues']:
         issue_type = issue['fields']['issuetype']['name']
@@ -87,10 +103,6 @@ def parse_issues(issue_data):
                 'Time in Status (days)': time_in_status[current_status]
             })
         
-        #if current_status not in active_statuses + final_statuses:
-         #   print(f"Unexpected status '{current_status}' for issue {issue['key']}")
-
-        #print(f"Processing changelog for issue {issue['key']}")
         in_active_status = False
 
         for entry in sorted(changelog, key=lambda x: datetime.strptime(x['created'], '%Y-%m-%dT%H:%M:%S.%f%z').date()):
@@ -105,13 +117,9 @@ def parse_issues(issue_data):
                         to_status = to_status.title()
                     
                     if to_status in active_statuses and not in_active_status:
-                        # Increment when entering an active status for the first time
-                        #print(f"Incrementing count for {change_date} due to entering {to_status}")
                         status_timeline[change_date] = status_timeline.get(change_date, 0) + 1
                         in_active_status = True
                     elif from_status in active_statuses and to_status in final_statuses:
-                        # Decrement when moving from an active status to a final status
-                        #print(f"Decrementing count for {change_date} due to leaving {from_status} and entering {to_status}")
                         status_timeline[change_date] = status_timeline.get(change_date, 0) - 1
                         in_active_status = False
 
@@ -128,6 +136,7 @@ def parse_issues(issue_data):
         if issue_type not in EXCLUDED_ISSUE_TYPES and in_progress_date and last_final_status_date and last_final_status_date > in_progress_date:
             cycle_time_seconds = (last_final_status_date - in_progress_date).total_seconds()
             cycle_time_days = cycle_time_seconds / 86400 + 1
+            cycle_times.append({'key': issue['key'], 'cycle_time': cycle_time_days, 'date': last_final_status_date.date()})
         else:
             cycle_time_days = None
 
@@ -142,7 +151,6 @@ def parse_issues(issue_data):
         })
 
     if status_timeline:
-        #print(f"Initial status timeline: {status_timeline}")
         min_date = min(status_timeline.keys())
         max_date = max(status_timeline.keys())
         full_timeline = {}
@@ -151,28 +159,30 @@ def parse_issues(issue_data):
             if single_date in status_timeline:
                 current_count += status_timeline[single_date]
             full_timeline[single_date] = max(0, current_count)
-        #print(f"Full timeline: {full_timeline}")
-        return issues, full_timeline, time_in_status_all_issues, current_status_times
+        return issues, full_timeline, time_in_status_all_issues, current_status_times, cycle_times
     else:
-        return issues, {}, time_in_status_all_issues, current_status_times
+        return issues, {}, time_in_status_all_issues, current_status_times, cycle_times
 
 def plot_wip_trend(active_state_dates):
     if active_state_dates:
         active_dates, counts = zip(*sorted(active_state_dates.items()))
-        #print(f"Active Dates: {active_dates}")
-        #print(f"Counts: {counts}")
         fig_active = go.Figure()
         fig_active.add_trace(go.Scatter(x=active_dates, y=counts, mode='lines+markers', name='Active Items Count'))
         fig_active.update_layout(title='WIP Trend', xaxis_title='Date', yaxis_title='Count')
         return pio.to_html(fig_active, full_html=False)
     return ""
 
-def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, sprint_id):
+def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id):
     df = pd.DataFrame(issues)
     df['Age (days)'] = pd.to_numeric(df['Age (days)'], errors='coerce').round(1)
     status_order = ["Ready For Dev", "Blocked", "In Progress", "Peer Review", "Pending Deployment", "Testing", "Approved For Release", "Closed"]
     df['Status'] = pd.Categorical(df['Status'], categories=status_order, ordered=True)
     df.sort_values('Status', inplace=True)
+
+    # Debugging: Print cycle_times
+    print("Cycle Times Data:")
+    for cycle in cycle_times:
+        print(cycle)
 
     # Plotting ticket ages by status
     fig_scatter = go.Figure()
@@ -226,16 +236,21 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
     )])
     fig_summary.update_layout(title='Status Summary', width=600, height=500)
 
+    # Cycle Time Plot
     fig_final_status_scatter = go.Figure()
+    if cycle_times:
+        cycle_df = pd.DataFrame(cycle_times)
+        avg_cycle_time = cycle_df['cycle_time'].mean().round(1)
+        percentiles = [50, 70, 85]
+        percentile_values = {percentile: np.percentile(cycle_df['cycle_time'], percentile) for percentile in percentiles}
 
-    # Ensure avg_age is always defined
-    avg_age = None
-    if not final_df['Cycle Time (days)'].dropna().empty:
-        avg_age = final_df['Cycle Time (days)'].mean().round(1)
-        for percentile in [50, 70, 85]:
-            value = np.percentile(final_df['Cycle Time (days)'].dropna(), percentile)
+        # Debugging: Print cycle_df
+        #print("Cycle DataFrame:")
+        #print(cycle_df)
+
+        for percentile, value in percentile_values.items():
             fig_final_status_scatter.add_trace(go.Scatter(
-                x=[final_df['Date'].min(), final_df['Date'].max()],
+                x=[cycle_df['date'].min(), cycle_df['date'].max()],
                 y=[value, value],
                 mode='lines',
                 line=dict(dash='dash'),
@@ -243,14 +258,22 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
             ))
 
         fig_final_status_scatter.add_trace(go.Scatter(
-            x=[final_df['Date'].min(), final_df['Date'].max()],
-            y=[avg_age, avg_age],
-            mode='lines',
-            line=dict(color='red', width=1, dash='dash'),
-            name='Average Age'
+            x=cycle_df['date'],
+            y=cycle_df['cycle_time'],
+            mode='markers',
+            marker=dict(size=12, color='blue'),
+            name='Cycle Time'
         ))
 
-    fig_final_status_scatter.update_layout(title='Cycle Time', xaxis_title='Date', yaxis_title='Age (days)', legend_title="Legend")
+        fig_final_status_scatter.add_trace(go.Scatter(
+            x=[cycle_df['date'].min(), cycle_df['date'].max()],
+            y=[avg_cycle_time, avg_cycle_time],
+            mode='lines',
+            line=dict(color='red', width=1, dash='dash'),
+            name='Average Cycle Time'
+        ))
+
+    fig_final_status_scatter.update_layout(title='Cycle Time', xaxis_title='Date', yaxis_title='Cycle Time (days)', legend_title="Legend")
 
     time_in_status_df = pd.DataFrame(time_in_status_all_issues).T.fillna(0)
     fig_time_in_status = go.Figure()
@@ -279,10 +302,10 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
     fig_current_status_scatter.update_layout(title='How long have ticket been in a column?', xaxis_title='Status', yaxis_title='Time in Status (days)', legend_title="Legend")
 
     fig_cycle = go.Figure()
-    if avg_age is not None:
+    if cycle_times:
         fig_cycle = go.Figure(data=[go.Table(
-            header=dict(values=['Average','85th']),
-            cells=dict(values=[avg_age,value])
+            header=dict(values=['Average Cycle Time','85th Percentile']),
+            cells=dict(values=[avg_cycle_time, percentile_values[85]])
         )])
         fig_cycle.update_layout(title='Cycle Time Stats', width=500, height=300)
 
@@ -311,7 +334,7 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
     {current_status_scatter_html}
     {table_html}
     {wip_trend_html}
-    <!--{final_html}-->
+    {final_html}
     {cycle_html_final}
     {summary_html}
     {pie_html_general}
@@ -326,14 +349,18 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
         f.write(html)
     print(f'{file_path} created')
 
-def main(sprint_id):
-    issue_data = get_issues_for_sprint(sprint_id)
-    if issue_data:
-        issues, active_state_dates, time_in_status_all_issues, current_status_times = parse_issues(issue_data)
-        plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, sprint_id)
+def main(board_id):
+    sprint_id = get_active_sprint_id(board_id)
+    if sprint_id:
+        issue_data = get_issues_for_sprint(sprint_id)
+        if issue_data:
+            issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times = parse_issues(issue_data)
+            plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id)
+        else:
+            print(f"Failed to retrieve data for sprint {sprint_id}")
     else:
-        print(f"Failed to retrieve data for sprint {sprint_id}")
+        print(f"Failed to retrieve an active sprint for board {board_id}")
 
 if __name__ == '__main__':
-    sprint_id = input("Enter Sprint ID: ")
-    main(sprint_id)
+    board_id = input("Enter Board ID: ")
+    main(board_id)
