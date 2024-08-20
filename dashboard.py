@@ -87,6 +87,7 @@ def parse_issues(issue_data):
     time_in_status_all_issues = {}
     current_status_times = []
     cycle_times = []
+    active_tickets_by_date = {}
 
     for issue in issue_data['issues']:
         issue_type = issue['fields']['issuetype']['name']
@@ -96,6 +97,9 @@ def parse_issues(issue_data):
         time_in_status_all_issues[issue['key']] = time_in_status
 
         current_status = issue['fields']['status']['name'].title()
+        if current_status == "Backlog":
+            continue  # Skip issues in "Backlog" status
+
         if current_status in time_in_status:
             current_status_times.append({
                 'Key': issue['key'],
@@ -115,16 +119,17 @@ def parse_issues(issue_data):
                         from_status = from_status.title()
                     if to_status:
                         to_status = to_status.title()
-                    
-                    if to_status in active_statuses and not in_active_status:
+
+                    if to_status in active_statuses and from_status not in active_statuses:
                         status_timeline[change_date] = status_timeline.get(change_date, 0) + 1
-                        in_active_status = True
-                    elif from_status in active_statuses and to_status in final_statuses:
+                        active_tickets_by_date.setdefault(change_date, []).append(issue['key'])
+                    elif from_status in active_statuses and to_status not in active_statuses:
                         status_timeline[change_date] = status_timeline.get(change_date, 0) - 1
-                        in_active_status = False
+                        if issue['key'] in active_tickets_by_date.get(change_date, []):
+                            active_tickets_by_date[change_date].remove(issue['key'])
 
         in_progress_date = find_status_change_date(changelog, ["In Progress"], find_earliest=True)
-        last_final_status_date = find_status_change_date(changelog, final_statuses, find_earliest=True)
+        last_final_status_date = find_status_change_date(changelog, final_statuses, find_earliest=False)
 
         if in_progress_date:
             end_date = last_final_status_date if last_final_status_date and last_final_status_date > in_progress_date else datetime.now(timezone.utc)
@@ -159,30 +164,49 @@ def parse_issues(issue_data):
             if single_date in status_timeline:
                 current_count += status_timeline[single_date]
             full_timeline[single_date] = max(0, current_count)
-        return issues, full_timeline, time_in_status_all_issues, current_status_times, cycle_times
-    else:
-        return issues, {}, time_in_status_all_issues, current_status_times, cycle_times
 
-def plot_wip_trend(active_state_dates):
+        for date, tickets in active_tickets_by_date.items():
+            print(f"DEBUG: Date: {date}, Tickets: {tickets}, Count: {len(tickets)}")
+
+        return issues, full_timeline, time_in_status_all_issues, current_status_times, cycle_times, active_tickets_by_date
+    else:
+        return issues, {}, time_in_status_all_issues, current_status_times, cycle_times, active_tickets_by_date
+
+
+
+def plot_wip_trend(active_state_dates, active_tickets_by_date):
     if active_state_dates:
         active_dates, counts = zip(*sorted(active_state_dates.items()))
+
+        # Detailed logging to debug the issue
+        #print("DEBUG: WIP Trend - Active Tickets by Date")
+        for date in active_dates:
+            tickets_on_date = active_tickets_by_date.get(date, [])
+            #print(f"Date: {date}, Graph Count: {counts[active_dates.index(date)]}, Hover Tickets: {tickets_on_date}, Hover Count: {len(tickets_on_date)}")
+        
         fig_active = go.Figure()
-        fig_active.add_trace(go.Scatter(x=active_dates, y=counts, mode='lines+markers', name='Active Items Count'))
+        fig_active.add_trace(go.Scatter(
+            x=active_dates, 
+            y=counts, 
+            mode='lines+markers', 
+            name='Active Items Count',
+            text=[f"{date}: {', '.join(active_tickets_by_date.get(date, []))}" for date in active_dates], 
+            hoverinfo='text'
+        ))
         fig_active.update_layout(title='WIP Trend', xaxis_title='Date', yaxis_title='Count')
         return pio.to_html(fig_active, full_html=False)
     return ""
 
-def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id):
+
+
+
+
+def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id, active_tickets_by_date):
     df = pd.DataFrame(issues)
     df['Age (days)'] = pd.to_numeric(df['Age (days)'], errors='coerce').round(1)
     status_order = ["Ready For Dev", "Blocked", "In Progress", "Peer Review", "Pending Deployment", "Testing", "Approved For Release", "Closed"]
     df['Status'] = pd.Categorical(df['Status'], categories=status_order, ordered=True)
     df.sort_values('Status', inplace=True)
-
-    # Debugging: Print cycle_times
-    print("Cycle Times Data:")
-    for cycle in cycle_times:
-        print(cycle)
 
     # Plotting ticket ages by status
     fig_scatter = go.Figure()
@@ -244,10 +268,6 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
         percentiles = [50, 70, 85]
         percentile_values = {percentile: np.percentile(cycle_df['cycle_time'], percentile) for percentile in percentiles}
 
-        # Debugging: Print cycle_df
-        #print("Cycle DataFrame:")
-        #print(cycle_df)
-
         for percentile, value in percentile_values.items():
             fig_final_status_scatter.add_trace(go.Scatter(
                 x=[cycle_df['date'].min(), cycle_df['date'].max()],
@@ -299,7 +319,7 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
             name=status
         ))
 
-    fig_current_status_scatter.update_layout(title='How long have ticket been in a column?', xaxis_title='Status', yaxis_title='Time in Status (days)', legend_title="Legend")
+    fig_current_status_scatter.update_layout(title='How long have tickets been in a column?', xaxis_title='Status', yaxis_title='Time in Status (days)', legend_title="Legend")
 
     fig_cycle = go.Figure()
     if cycle_times:
@@ -320,7 +340,7 @@ def plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issue
     time_in_status_html = pio.to_html(fig_time_in_status, full_html=False)
     current_status_scatter_html = pio.to_html(fig_current_status_scatter, full_html=False)
     
-    wip_trend_html = plot_wip_trend(active_state_dates)
+    wip_trend_html = plot_wip_trend(active_state_dates, active_tickets_by_date)
 
     html = f"""
     <html>
@@ -354,8 +374,8 @@ def main(board_id):
     if sprint_id:
         issue_data = get_issues_for_sprint(sprint_id)
         if issue_data:
-            issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times = parse_issues(issue_data)
-            plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id)
+            issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, active_tickets_by_date = parse_issues(issue_data)
+            plot_data_and_save_html(issues, active_state_dates, time_in_status_all_issues, current_status_times, cycle_times, sprint_id, active_tickets_by_date)
         else:
             print(f"Failed to retrieve data for sprint {sprint_id}")
     else:
@@ -364,3 +384,4 @@ def main(board_id):
 if __name__ == '__main__':
     board_id = input("Enter Board ID: ")
     main(board_id)
+
